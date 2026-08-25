@@ -1,0 +1,4 @@
+node_modules/
+*.partial.mp4
+*.trim-report.json
+.DS_Store
