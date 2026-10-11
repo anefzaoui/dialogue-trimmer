@@ -2,20 +2,17 @@
 /**
  * dialogue-trimmer: remove non-dialogue lead-in/tail and optionally assemble clips.
  *
+ * The CLI sits on top of the library (index.js + lib/); keep them together.
  * Requirements: Node.js >= 20, ffmpeg + ffprobe, and the declared Echogarden
  * dependency. External programs are spawned without a shell for portable path
  * handling on macOS, Linux, and Windows.
  */
 
-import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { detectVoiceActivity } from 'echogarden';
+import { checkTools, detectDialogue, renderClips, TRIM_DEFAULTS, RENDER_DEFAULTS, VERSION } from './index.js';
 
-const VERSION = '1.0.0';
 const TOOL = 'dialogue-trimmer';
-const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
-const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe';
 
 const isTTY = process.stdout.isTTY;
 let useColor = isTTY && !process.env.NO_COLOR;
@@ -55,7 +52,11 @@ Pauses between lines remain untouched. Source files are never modified.
 ${c.bold('Options:')}
   --out <file>          Output MP4 (default: <clip>-dialogue-trimmed.mp4 for one input)
   --report <file>       JSON audit path (default: beside output)
-  --pad <seconds>       Safety padding before/after detected voice (default: 0.08)
+  --pad <seconds>       Padding on both edges (sets --pad-before and --pad-after)
+  --pad-before <s>      Kept before the first detected voice (default: 0.08)
+  --pad-after <s>       Kept after the last detected voice (default: 0.15)
+  --snap-window <s>     Snap each cut to the quietest moment within ± this many
+                        seconds, never into the speech (default: 0.08; 0 = off)
   --threshold <0..1>    Voice probability threshold (default: 0.5)
   --engine <name>       silero or webrtc (default: silero)
   --crf <n>             H.264 output quality (default: 18)
@@ -75,8 +76,10 @@ ${c.bold('Environment:')}
 
 function parseArgs(argv) {
   const opts = {
-    inputs:[],out:null,report:null,pad:0.08,threshold:0.5,engine:'silero',
-    crf:18,preset:'medium',audioBitrate:'192k',dryRun:false,force:false,json:false
+    inputs:[],out:null,report:null,pad:null,padBefore:null,padAfter:null,snapWindow:TRIM_DEFAULTS.snapWindow,
+    threshold:TRIM_DEFAULTS.threshold,engine:TRIM_DEFAULTS.engine,
+    crf:RENDER_DEFAULTS.crf,preset:RENDER_DEFAULTS.preset,audioBitrate:RENDER_DEFAULTS.audioBitrate,
+    dryRun:false,force:false,json:false
   };
   for (let i=0;i<argv.length;i++) {
     let arg=argv[i];
@@ -94,6 +97,9 @@ function parseArgs(argv) {
       case '--out': opts.out=value(); break;
       case '--report': opts.report=value(); break;
       case '--pad': opts.pad=Number(value()); break;
+      case '--pad-before': opts.padBefore=Number(value()); break;
+      case '--pad-after': opts.padAfter=Number(value()); break;
+      case '--snap-window': opts.snapWindow=Number(value()); break;
       case '--threshold': opts.threshold=Number(value()); break;
       case '--engine': opts.engine=value(); break;
       case '--crf': opts.crf=Number(value()); break;
@@ -110,50 +116,18 @@ function parseArgs(argv) {
     }
   }
   if (!opts.inputs.length) { console.log(HELP); process.exit(2); }
-  if (!Number.isFinite(opts.pad) || opts.pad<0 || opts.pad>2) die('--pad must be between 0 and 2 seconds');
+  // --pad sets both edges; --pad-before/--pad-after win over it whatever the order
+  opts.padBefore=opts.padBefore??opts.pad??TRIM_DEFAULTS.padBefore;
+  opts.padAfter=opts.padAfter??opts.pad??TRIM_DEFAULTS.padAfter;
+  for (const [flag,v] of [['--pad-before',opts.padBefore],['--pad-after',opts.padAfter]]) {
+    if (!Number.isFinite(v) || v<0 || v>2) die(`${flag} must be between 0 and 2 seconds`);
+  }
+  if (!Number.isFinite(opts.snapWindow) || opts.snapWindow<0 || opts.snapWindow>1) die('--snap-window must be between 0 and 1 second');
   if (!Number.isFinite(opts.threshold) || opts.threshold<0 || opts.threshold>1) die('--threshold must be between 0 and 1');
   if (!Number.isFinite(opts.crf) || opts.crf<0 || opts.crf>51) die('--crf must be between 0 and 51');
   if (!['silero','webrtc'].includes(opts.engine)) die('--engine must be silero or webrtc');
   if (!/^[1-9][0-9]*k$/i.test(opts.audioBitrate)) die('--audio-bitrate must look like 192k');
   return opts;
-}
-
-function preflight() {
-  for (const executable of [FFMPEG,FFPROBE]) {
-    try { execFileSync(executable,['-version'],{stdio:'ignore'}); }
-    catch { die(`${executable} not found. Install FFmpeg or set FFMPEG_PATH/FFPROBE_PATH`); }
-  }
-}
-
-function run(executable,args,{onStdout}={}) {
-  return new Promise((resolve,reject)=>{
-    const child=spawn(executable,args,{stdio:['ignore','pipe','pipe'],shell:false});
-    let stdout=''; let stderr='';
-    child.stdout.on('data',(chunk)=>{ const text=chunk.toString(); stdout+=text; onStdout?.(text); });
-    child.stderr.on('data',(chunk)=>{ if (stderr.length<64*1024*1024) stderr+=chunk.toString(); });
-    child.on('error',reject);
-    child.on('close',(code)=> code===0
-      ? resolve({stdout,stderr})
-      : reject(new Error(`${path.basename(executable)} exited ${code}: ${stderr.split('\n').filter(Boolean).slice(-5).join(' | ')}`)));
-  });
-}
-
-async function probe(file) {
-  const {stdout}=await run(FFPROBE,['-v','error','-show_streams','-show_format','-of','json',file]);
-  const data=JSON.parse(stdout);
-  const video=(data.streams||[]).find((stream)=>stream.codec_type==='video');
-  const audio=(data.streams||[]).find((stream)=>stream.codec_type==='audio');
-  if (!video) throw new Error(`no video stream in ${file}`);
-  if (!audio) throw new Error(`no audio stream in ${file}; voice activity cannot be detected`);
-  const duration=Number(data.format?.duration)||Number(video.duration)||Number(audio.duration)||0;
-  if (!(duration>0)) throw new Error(`invalid duration for ${file}`);
-  return {
-    duration,width:Number(video.width),height:Number(video.height),
-    fps:String(video.r_frame_rate||video.avg_frame_rate||'24/1'),
-    videoCodec:video.codec_name,audioCodec:audio.codec_name,
-    sampleRate:Number(audio.sample_rate)||null,channels:Number(audio.channels)||null,
-    sizeBytes:Number(data.format?.size)||fs.statSync(file).size
-  };
 }
 
 function atomicJson(file,data) {
@@ -167,7 +141,7 @@ function seconds(value) { return Number(Number(value).toFixed(3)); }
 
 async function main() {
   const opts=parseArgs(process.argv.slice(2));
-  preflight();
+  try { checkTools(); } catch (error) { die(error.message); }
 
   const inputs=opts.inputs.map((input)=>path.resolve(input));
   for (const input of inputs) if (!fs.existsSync(input)) die(`input not found: ${input}`);
@@ -187,106 +161,41 @@ async function main() {
   log(`${c.dim('inputs  ')} ${inputs.length}`);
   log(`${c.dim('output  ')} ${output}`);
 
+  const trimOpts={engine:opts.engine,threshold:opts.threshold,padBefore:opts.padBefore,padAfter:opts.padAfter,snapWindow:opts.snapWindow};
   const clips=[];
   for (let index=0;index<inputs.length;index++) {
-    const input=inputs[index];
-    const media=await probe(input);
-    log(`${c.cyan('detect  ')} ${index+1}/${inputs.length} ${path.basename(input)}`);
-    const vad=await detectVoiceActivity(input,{
-      engine:opts.engine,activityThreshold:opts.threshold,
-      silero:{frameDuration:90},webrtc:{frameDuration:30,mode:1}
-    },{logLevel:'silent'});
-    // keep only active-speech segments; current engines emit nothing else, but
-    // the boundary math must not depend on that staying true
-    const activity=vad.timeline
-      .filter(({text})=>text==='active')
-      .map(({type,text,startTime,endTime})=>({type,text,startTime,endTime}));
-    if (!activity.length) throw new Error(`no voice detected in ${input}`);
-    const speechStart=Number(activity[0].startTime);
-    const speechEnd=Number(activity.at(-1).endTime);
-    if (activity.length===1 && speechStart<=0.05 && speechEnd>=media.duration-0.05) {
-      warn(`${path.basename(input)}: detector reports one speech span covering the whole clip; nothing will be trimmed. The ${opts.engine} engine may be too coarse for this material (silero is the precise default).`);
+    log(`${c.cyan('detect  ')} ${index+1}/${inputs.length} ${path.basename(inputs[index])}`);
+    const clip=await detectDialogue(inputs[index],trimOpts);
+    if (clip.wholeClipIsSpeech) {
+      warn(`${path.basename(clip.input)}: detector reports one speech span covering the whole clip; nothing will be trimmed. The ${opts.engine} engine may be too coarse for this material (silero is the precise default).`);
     }
-    const trimStart=Math.max(0,speechStart-opts.pad);
-    const trimEnd=Math.min(media.duration,speechEnd+opts.pad);
-    clips.push({
-      index:index+1,input,source:media,voiceActivity:activity,
-      speechStart,speechEnd,trimStart,trimEnd,
-      leadingRemoved:trimStart,trailingRemoved:media.duration-trimEnd,
-      trimmedDuration:trimEnd-trimStart
-    });
-    log(`${c.green('keep    ')} ${seconds(trimStart)}s → ${seconds(trimEnd)}s (${seconds(trimEnd-trimStart)}s)`);
+    clips.push({index:index+1,...clip});
+    log(`${c.green('keep    ')} ${seconds(clip.trimStart)}s → ${seconds(clip.trimEnd)}s (${seconds(clip.trimmedDuration)}s)`);
   }
 
   const sourceDuration=clips.reduce((sum,clip)=>sum+clip.source.duration,0);
   const plannedDuration=clips.reduce((sum,clip)=>sum+clip.trimmedDuration,0);
-  let finalDuration=null;
+  let rendered=null;
   if (!opts.dryRun) {
-    fs.mkdirSync(path.dirname(output),{recursive:true});
-    const partial=path.join(path.dirname(output),`.${outputStem}.${process.pid}.partial.mp4`);
-    const width=Math.max(2,clips[0].source.width-(clips[0].source.width%2));
-    const height=Math.max(2,clips[0].source.height-(clips[0].source.height%2));
-    let fps=clips[0].source.fps;
-    const [fpsNum,fpsDen]=String(fps).split('/').map(Number);
-    if (!(fpsNum>0) || (fps.includes('/') && !(fpsDen>0))) {
-      warn(`unusable frame rate "${fps}" reported by probe, falling back to 24`);
-      fps='24';
-    }
-    // normalize audio to the first clip's channel layout so concat behaves the
-    // same on every ffmpeg version instead of relying on auto-negotiation
-    const channelLayout=(clips[0].source.channels||2)===1?'mono':'stereo';
-    const filters=[];
-    for (let index=0;index<clips.length;index++) {
-      const clip=clips[index];
-      filters.push(
-        `[${index}:v:0]trim=start=${clip.trimStart.toFixed(6)}:end=${clip.trimEnd.toFixed(6)},`+
-        `setpts=PTS-STARTPTS,fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=decrease,`+
-        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${index}]`
-      );
-      filters.push(
-        `[${index}:a:0]atrim=start=${clip.trimStart.toFixed(6)}:end=${clip.trimEnd.toFixed(6)},`+
-        `asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=${channelLayout}[a${index}]`
-      );
-    }
-    filters.push(`${clips.map((_,index)=>`[v${index}][a${index}]`).join('')}concat=n=${clips.length}:v=1:a=1[vout][aout]`);
     try {
-      await run(FFMPEG,[
-        '-y','-hide_banner','-loglevel','error',
-        ...inputs.flatMap((input)=>['-i',input]),
-        '-filter_complex',filters.join(';'),
-        '-map','[vout]','-map','[aout]',
-        '-c:v','libx264','-preset',opts.preset,'-crf',String(opts.crf),
-        '-c:a','aac','-b:a',opts.audioBitrate,'-movflags','+faststart',
-        '-progress','pipe:1',partial
-      ],{onStdout:(text)=>{
-        const match=text.match(/out_time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
-        if (match && plannedDuration>0) {
-          const done=Number(match[1])*3600+Number(match[2])*60+Number(match[3]);
-          const percent=Math.min(100,(done/plannedDuration)*100);
-          progressLine(`${c.cyan('render  ')} ${percent.toFixed(0).padStart(3)}% of ${seconds(plannedDuration)}s`);
-        }
-      }});
-      endProgress();
-      const finalProbe=await probe(partial);
-      finalDuration=finalProbe.duration;
-      if (Math.abs(finalDuration-plannedDuration)>0.25) {
-        warn(`output duration ${seconds(finalDuration)}s differs from plan ${seconds(plannedDuration)}s by ${seconds(Math.abs(finalDuration-plannedDuration))}s`);
-      }
-      if (fs.existsSync(output)) fs.unlinkSync(output);
-      fs.renameSync(partial,output);
-    } catch(error) {
-      endProgress();
-      if (fs.existsSync(partial)) fs.unlinkSync(partial);
-      throw error;
+      rendered=await renderClips(clips,output,{crf:opts.crf,preset:opts.preset,audioBitrate:opts.audioBitrate},{
+        onProgress:(f)=>progressLine(`${c.cyan('render  ')} ${(f*100).toFixed(0).padStart(3)}% of ${seconds(plannedDuration)}s`)
+      });
+    } finally { endProgress(); }
+    if (rendered.fpsFallback) warn(`unusable frame rate "${clips[0].source.fps}" reported by probe, fell back to 24`);
+    if (rendered.driftWarning) {
+      warn(`output duration ${seconds(rendered.finalDuration)}s differs from plan ${seconds(plannedDuration)}s by ${seconds(Math.abs(rendered.drift))}s`);
     }
   }
+  const finalDuration=rendered?rendered.finalDuration:null;
 
   const report={
     tool:TOOL,version:VERSION,createdAt:new Date().toISOString(),
     output:opts.dryRun?null:output,
-    settings:{padSeconds:opts.pad,engine:opts.engine,activityThreshold:opts.threshold,crf:opts.crf,preset:opts.preset,audioBitrate:opts.audioBitrate},
+    settings:{padBefore:opts.padBefore,padAfter:opts.padAfter,snapWindow:opts.snapWindow,engine:opts.engine,activityThreshold:opts.threshold,crf:opts.crf,preset:opts.preset,audioBitrate:opts.audioBitrate},
     sourceDuration:seconds(sourceDuration),plannedDuration:seconds(plannedDuration),
     finalDuration:finalDuration===null?null:seconds(finalDuration),
+    durationDrift:rendered?seconds(rendered.drift):null,durationDriftWarning:rendered?rendered.driftWarning:null,
     leadingRemoved:seconds(clips.reduce((sum,clip)=>sum+clip.leadingRemoved,0)),
     trailingRemoved:seconds(clips.reduce((sum,clip)=>sum+clip.trailingRemoved,0)),
     totalRemoved:seconds(sourceDuration-plannedDuration),
@@ -294,6 +203,7 @@ async function main() {
       index:clip.index,input:clip.input,source:clip.source,
       speechStart:seconds(clip.speechStart),speechEnd:seconds(clip.speechEnd),
       trimStart:seconds(clip.trimStart),trimEnd:seconds(clip.trimEnd),
+      paddedStart:seconds(clip.paddedStart),paddedEnd:seconds(clip.paddedEnd),
       leadingRemoved:seconds(clip.leadingRemoved),trailingRemoved:seconds(clip.trailingRemoved),
       trimmedDuration:seconds(clip.trimmedDuration),voiceActivity:clip.voiceActivity
     }))
