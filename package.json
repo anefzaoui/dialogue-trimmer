@@ -1,13 +1,13 @@
 {
   "name": "dialogue-trimmer",
-  "version": "1.0.0",
-  "description": "Cross-platform CLI that removes non-dialogue lead-in and tail from video clips with voice activity detection, then optionally assembles them.",
+  "version": "1.1.0",
+  "description": "Cross-platform CLI and library that removes non-dialogue lead-in and tail from video clips with voice activity detection, snaps every cut to the quietest moment, then optionally assembles them.",
   "type": "module",
   "bin": {
     "dialogue-trimmer": "./dialogue-trimmer.js"
   },
   "scripts": {
-    "test": "node --check dialogue-trimmer.js && node dialogue-trimmer.js --help"
+    "test": "node --test \"test/**/*.test.js\""
   },
   "engines": {
     "node": ">=20"
@@ -23,11 +23,23 @@
     "ffmpeg",
     "dead-air",
     "video-editing",
-    "microdrama"
+    "microdrama",
+    "library"
   ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/anefzaoui/dialogue-trimmer.git"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "dialogue-trimmer.js",
+    "README.md",
+    "LICENSE"
+  ]
 }
